@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import logging
 import cv2
 import torch
@@ -29,6 +30,7 @@ class YOLOService:
         self.use_half = False
         self.last_inference_latency_ms = 0.0
         self.inference_count = 0
+        self.infer_lock = threading.Lock()
         
         # Load and configure YOLO model
         self.load_model()
@@ -94,89 +96,90 @@ class YOLOService:
         detections: List[Dict[str, Any]] = []
         counts: Dict[str, int] = {"person": 0, "vehicle": 0, "total": 0}
 
-        t_start = time.perf_counter()
-        try:
-            orig_h, orig_w = frame.shape[:2]
-            
-            # Ultra-fast pre-scaling to avoid large CPU array normalization overhead
-            if max(orig_h, orig_w) > self.imgsz:
-                scale_factor = float(self.imgsz) / float(max(orig_h, orig_w))
-                infer_w = int(orig_w * scale_factor)
-                infer_h = int(orig_h * scale_factor)
-                infer_frame = cv2.resize(frame, (infer_w, infer_h), interpolation=cv2.INTER_LINEAR)
-                inv_scale_x = float(orig_w) / float(infer_w)
-                inv_scale_y = float(orig_h) / float(infer_h)
-            else:
-                infer_frame = frame
-                inv_scale_x = 1.0
-                inv_scale_y = 1.0
+        with self.infer_lock:
+            t_start = time.perf_counter()
+            try:
+                orig_h, orig_w = frame.shape[:2]
+                
+                # Ultra-fast pre-scaling to avoid large CPU array normalization overhead
+                if max(orig_h, orig_w) > self.imgsz:
+                    scale_factor = float(self.imgsz) / float(max(orig_h, orig_w))
+                    infer_w = int(orig_w * scale_factor)
+                    infer_h = int(orig_h * scale_factor)
+                    infer_frame = cv2.resize(frame, (infer_w, infer_h), interpolation=cv2.INTER_LINEAR)
+                    inv_scale_x = float(orig_w) / float(infer_w)
+                    inv_scale_y = float(orig_h) / float(infer_h)
+                else:
+                    infer_frame = frame
+                    inv_scale_x = 1.0
+                    inv_scale_y = 1.0
 
-            with torch.inference_mode():
-                results = self.model.track(
-                    infer_frame,
-                    persist=True,
-                    tracker="bytetrack.yaml",
-                    conf=self.confidence,
-                    iou=self.iou,
-                    imgsz=self.imgsz,
-                    device=self.device,
-                    half=self.use_half,
-                    verbose=False
-                )
+                with torch.inference_mode():
+                    results = self.model.track(
+                        infer_frame,
+                        persist=True,
+                        tracker="bytetrack.yaml",
+                        conf=self.confidence,
+                        iou=self.iou,
+                        imgsz=self.imgsz,
+                        device=self.device,
+                        half=self.use_half,
+                        verbose=False
+                    )
 
-            if results and len(results) > 0:
-                result = results[0]
-                boxes = result.boxes
+                if results and len(results) > 0:
+                    result = results[0]
+                    boxes = result.boxes
 
-                if boxes is not None and len(boxes) > 0:
-                    xyxy_arr = boxes.xyxy.cpu().numpy()
-                    conf_arr = boxes.conf.cpu().numpy()
-                    cls_arr = boxes.cls.cpu().numpy().astype(int)
-                    id_arr = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
+                    if boxes is not None and len(boxes) > 0:
+                        xyxy_arr = boxes.xyxy.cpu().numpy()
+                        conf_arr = boxes.conf.cpu().numpy()
+                        cls_arr = boxes.cls.cpu().numpy().astype(int)
+                        id_arr = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
 
-                    names = self.model.names
-                    for i in range(len(boxes)):
-                        # Scale coordinates back to original frame space
-                        x1 = int(xyxy_arr[i][0] * inv_scale_x)
-                        y1 = int(xyxy_arr[i][1] * inv_scale_y)
-                        x2 = int(xyxy_arr[i][2] * inv_scale_x)
-                        y2 = int(xyxy_arr[i][3] * inv_scale_y)
-                        
-                        conf = float(conf_arr[i])
-                        cls_id = int(cls_arr[i])
-                        cls_name = names.get(cls_id, f"class_{cls_id}")
-                        track_id = int(id_arr[i]) if id_arr is not None else None
+                        names = self.model.names
+                        for i in range(len(boxes)):
+                            # Scale coordinates back to original frame space
+                            x1 = int(xyxy_arr[i][0] * inv_scale_x)
+                            y1 = int(xyxy_arr[i][1] * inv_scale_y)
+                            x2 = int(xyxy_arr[i][2] * inv_scale_x)
+                            y2 = int(xyxy_arr[i][3] * inv_scale_y)
+                            
+                            conf = float(conf_arr[i])
+                            cls_id = int(cls_arr[i])
+                            cls_name = names.get(cls_id, f"class_{cls_id}")
+                            track_id = int(id_arr[i]) if id_arr is not None else None
 
-                        counts["total"] += 1
-                        if cls_name == "person":
-                            counts["person"] += 1
-                        elif cls_name in ("car", "motorcycle", "bus", "truck", "bicycle", "vehicle"):
-                            counts["vehicle"] += 1
+                            counts["total"] += 1
+                            if cls_name == "person":
+                                counts["person"] += 1
+                            elif cls_name in ("car", "motorcycle", "bus", "truck", "bicycle", "vehicle"):
+                                counts["vehicle"] += 1
 
-                        if cls_name not in counts:
-                            counts[cls_name] = 1
-                        elif cls_name not in ("person", "vehicle", "total"):
-                            counts[cls_name] += 1
+                            if cls_name not in counts:
+                                counts[cls_name] = 1
+                            elif cls_name not in ("person", "vehicle", "total"):
+                                counts[cls_name] += 1
 
-                        detections.append({
-                            "track_id": track_id,
-                            "class": cls_name,
-                            "confidence": round(conf, 2),
-                            "bbox": {
-                                "x1": max(0, min(orig_w - 1, x1)),
-                                "y1": max(0, min(orig_h - 1, y1)),
-                                "x2": max(0, min(orig_w - 1, x2)),
-                                "y2": max(0, min(orig_h - 1, y2))
-                            }
-                        })
+                            detections.append({
+                                "track_id": track_id,
+                                "class": cls_name,
+                                "confidence": round(conf, 2),
+                                "bbox": {
+                                    "x1": max(0, min(orig_w - 1, x1)),
+                                    "y1": max(0, min(orig_h - 1, y1)),
+                                    "x2": max(0, min(orig_w - 1, x2)),
+                                    "y2": max(0, min(orig_h - 1, y2))
+                                }
+                            })
 
-            self.inference_count += 1
-            self.last_inference_latency_ms = round((time.perf_counter() - t_start) * 1000, 1)
+                self.inference_count += 1
+                self.last_inference_latency_ms = round((time.perf_counter() - t_start) * 1000, 1)
 
-        except Exception as e:
-            logger.error(f"[YOLO11] Inference error: {e}")
+            except Exception as e:
+                logger.error(f"[YOLO11] Inference error: {e}")
 
-        return detections, counts
+            return detections, counts
 
     def draw_detections_on_frame(self, frame: np.ndarray, detections: List[Dict[str, Any]], in_place: bool = False) -> np.ndarray:
         """

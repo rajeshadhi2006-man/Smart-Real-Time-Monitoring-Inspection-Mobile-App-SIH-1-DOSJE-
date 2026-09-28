@@ -382,7 +382,7 @@ async def cctv_camera_websocket(websocket: WebSocket, camera_id: str):
             raw_msg = await websocket.receive()
             if "bytes" in raw_msg and raw_msg["bytes"]:
                 # Ultra-fast raw JPEG binary frame from Flutter Android App
-                cctv_stream_manager.ingest_frame_bytes(raw_msg["bytes"])
+                await asyncio.to_thread(cctv_stream_manager.ingest_frame_bytes, raw_msg["bytes"])
             elif "text" in raw_msg and raw_msg["text"]:
                 try:
                     msg = json.loads(raw_msg["text"])
@@ -397,7 +397,7 @@ async def cctv_camera_websocket(websocket: WebSocket, camera_id: str):
                         frame_data = msg.get("data", {})
                         img_b64 = frame_data.get("image")
                         if img_b64:
-                            cctv_stream_manager.ingest_frame_base64(img_b64)
+                            await asyncio.to_thread(cctv_stream_manager.ingest_frame_base64, img_b64)
                 except Exception:
                     pass
     except (WebSocketDisconnect, Exception):

@@ -152,6 +152,8 @@ export const CCTV: React.FC = () => {
   const browserCamOverlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const browserCamStreamRef = useRef<MediaStream | null>(null);
   const browserCamTimerRef = useRef<any>(null);
+  const isBrowserCamActiveRef = useRef(false);
+  isBrowserCamActiveRef.current = isBrowserCamActive;
 
   // Draws high-tech YOLO11 bounding boxes directly on the overlay canvas
   const drawDetectionsOverlay = useCallback((detections: any[], videoEl: HTMLVideoElement | null, canvasEl: HTMLCanvasElement | null) => {
@@ -159,36 +161,67 @@ export const CCTV: React.FC = () => {
     const ctx = canvasEl.getContext('2d');
     if (!ctx) return;
 
-    const width = videoEl.clientWidth || canvasEl.clientWidth || 640;
-    const height = videoEl.clientHeight || canvasEl.clientHeight || 480;
+    const containerWidth = videoEl.clientWidth || canvasEl.clientWidth || 640;
+    const containerHeight = videoEl.clientHeight || canvasEl.clientHeight || 480;
 
-    if (canvasEl.width !== width || canvasEl.height !== height) {
-      canvasEl.width = width;
-      canvasEl.height = height;
+    if (canvasEl.width !== containerWidth || canvasEl.height !== containerHeight) {
+      canvasEl.width = containerWidth;
+      canvasEl.height = containerHeight;
     }
 
     ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
 
     if (!detections || detections.length === 0) return;
 
+    // Calculate actual rendered video dimensions inside object-contain
+    const videoWidth = videoEl.videoWidth || 640;
+    const videoHeight = videoEl.videoHeight || 480;
+    const videoAspect = videoWidth / videoHeight;
+    const containerAspect = containerWidth / containerHeight;
+
+    let renderWidth = containerWidth;
+    let renderHeight = containerHeight;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (containerAspect > videoAspect) {
+      // Letterbox left & right
+      renderWidth = containerHeight * videoAspect;
+      offsetX = (containerWidth - renderWidth) / 2;
+    } else {
+      // Letterbox top & bottom
+      renderHeight = containerWidth / videoAspect;
+      offsetY = (containerHeight - renderHeight) / 2;
+    }
+
     // The frames sent to YOLO11 inference are 640x480
-    const scaleX = width / 640;
-    const scaleY = height / 480;
+    const scaleX = renderWidth / 640;
+    const scaleY = renderHeight / 480;
 
     for (const det of detections) {
       const bbox = det.bbox;
       if (!bbox) continue;
 
-      const x1 = (bbox.x1 ?? 0) * scaleX;
-      const y1 = (bbox.y1 ?? 0) * scaleY;
-      const x2 = (bbox.x2 ?? 0) * scaleX;
-      const y2 = (bbox.y2 ?? 0) * scaleY;
+      let x1 = offsetX + (bbox.x1 ?? 0) * scaleX;
+      let y1 = offsetY + (bbox.y1 ?? 0) * scaleY;
+      let x2 = offsetX + (bbox.x2 ?? 0) * scaleX;
+      let y2 = offsetY + (bbox.y2 ?? 0) * scaleY;
+
+      // Handle video mirror reflection: flip box coordinates so they match the video,
+      // while keeping text badges un-mirrored and fully readable!
+      if (isMirrored) {
+        const flippedX1 = offsetX + renderWidth - ((bbox.x2 ?? 0) * scaleX);
+        const flippedX2 = offsetX + renderWidth - ((bbox.x1 ?? 0) * scaleX);
+        x1 = flippedX1;
+        x2 = flippedX2;
+      }
+
       const w = Math.max(0, x2 - x1);
       const h = Math.max(0, y2 - y1);
 
       const isPerson = det.class === 'person';
       const color = isPerson ? '#10B981' : '#06B6D4'; // Emerald for person, Cyan for other
-      const bgColor = isPerson ? 'rgba(16, 185, 129, 0.2)' : 'rgba(6, 182, 212, 0.2)';
+      const bgColor = isPerson ? 'rgba(16, 185, 129, 0.25)' : 'rgba(6, 182, 212, 0.25)';
 
       // 1. Semi-transparent box fill
       ctx.fillStyle = bgColor;
@@ -230,7 +263,7 @@ export const CCTV: React.FC = () => {
       ctx.fillStyle = '#0F172A';
       ctx.fillText(labelText, x1 + 6, badgeY + 13);
     }
-  }, []);
+  }, [isMirrored]);
 
   const startBrowserCam = async () => {
     try {
@@ -269,62 +302,43 @@ export const CCTV: React.FC = () => {
       canvas.height = 480;
       const ctx = canvas.getContext('2d');
 
-      let frameCounter = 0;
-      let isUploadingHttp = false;
+      let isBusy = false;
 
       if (browserCamTimerRef.current) clearInterval(browserCamTimerRef.current);
       browserCamTimerRef.current = setInterval(async () => {
         const vid = browserCamVideoRef.current;
-        if (!vid || !ctx || vid.readyState < 2) return;
-        ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        const b64 = canvas.toDataURL('image/jpeg', 0.65);
-        frameCounter++;
+        if (!vid || !ctx || vid.readyState < 2 || isBusy) return;
+        isBusy = true;
+        try {
+          ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+          const b64 = canvas.toDataURL('image/jpeg', 0.65);
 
-        // 1. Send via primary WebSocket if connected
-        let sentViaWs = false;
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          try {
-            wsRef.current.send(
-              JSON.stringify({
-                type: 'CCTV_FRAME',
-                data: {
-                  camera_id: selectedCameraId,
-                  image: b64,
-                  timestamp: new Date().toISOString(),
-                },
-              })
-            );
-            sentViaWs = true;
-          } catch {}
-        }
+          // Direct HTTP upload returns the processed YOLO11 detections immediately
+          const res = await uploadCCTVFrame({
+            camera_id: selectedCameraId,
+            image: b64,
+          });
 
-        // 2. Continuous HTTP frame upload fallback: guarantees YOLO11 runs and returns detections immediately
-        if ((!sentViaWs || frameCounter % 3 === 0) && !isUploadingHttp) {
-          isUploadingHttp = true;
-          try {
-            const res = await uploadCCTVFrame({
-              camera_id: selectedCameraId,
-              image: b64,
-            });
-            if (res && res.detections) {
-              setTelemetry((prev) => ({
-                ...prev,
-                ...res,
-                status: 'LIVE',
-              }));
+          if (res) {
+            setTelemetry((prev) => ({
+              ...prev,
+              ...res,
+              status: 'LIVE',
+            }));
+            if (res.detections) {
               drawDetectionsOverlay(
                 res.detections,
                 browserCamVideoRef.current,
                 browserCamOverlayCanvasRef.current
               );
             }
-          } catch (e) {
-            console.warn('HTTP frame upload error:', e);
-          } finally {
-            isUploadingHttp = false;
           }
+        } catch (e) {
+          console.warn('Frame processing error:', e);
+        } finally {
+          isBusy = false;
         }
-      }, 120);
+      }, 150);
     } catch (err: any) {
       console.error('Camera access error:', err);
       setBrowserCamError(err.message || 'Camera permission denied or camera not found on this device');
@@ -470,8 +484,19 @@ export const CCTV: React.FC = () => {
           try {
             const data = JSON.parse(event.data);
             if (data.camera_id || data.status) {
-              setTelemetry(data);
-              setStreamError(data.status === 'OFFLINE');
+              if (isBrowserCamActiveRef.current) {
+                if (data.source === 'In-Browser Cam (YOLO11)' || (data.detections && data.detections.length > 0)) {
+                  setTelemetry(data);
+                  drawDetectionsOverlay(
+                    data.detections || [],
+                    browserCamVideoRef.current,
+                    browserCamOverlayCanvasRef.current
+                  );
+                }
+              } else {
+                setTelemetry(data);
+                setStreamError(data.status === 'OFFLINE');
+              }
             }
           } catch {}
         };
@@ -1267,8 +1292,6 @@ export const CCTV: React.FC = () => {
                 <canvas
                   ref={browserCamOverlayCanvasRef}
                   className={`absolute inset-0 w-full h-full pointer-events-none ${
-                    isMirrored ? '-scale-x-100' : ''
-                  } ${
                     zoomLevel === 2 ? 'scale-125' : zoomLevel === 3 ? 'scale-150' : ''
                   }`}
                 />

@@ -421,6 +421,11 @@ class CCTVStreamManager:
                     failed_connect_attempts = 0
                     consecutive_read_failures = 0
 
+                # If in-browser webcam or mobile camera frames are actively being ingested, yield capture worker
+                if time.time() - getattr(self, "last_ingest_time", 0.0) < 3.0:
+                    time.sleep(0.033)
+                    continue
+
                 # Read raw camera frame
                 loop_start = time.perf_counter()
                 try:
@@ -527,6 +532,11 @@ class CCTVStreamManager:
                 # If running on simulated fallback frames, do not wipe counts with YOLO on stick figures
                 if self.is_fallback:
                     time.sleep(0.03)
+                    continue
+
+                # If in-browser webcam or mobile camera frames are actively being ingested, yield yolo worker
+                if time.time() - getattr(self, "last_ingest_time", 0.0) < 3.0:
+                    time.sleep(0.033)
                     continue
 
                 # Run ultra-fast YOLO11 detection and tracking
@@ -681,7 +691,7 @@ class CCTVStreamManager:
                     "status": "LIVE",
                     "connected": True,
                     "is_fallback": False,
-                    "source": "In-Browser / Mobile Stream",
+                    "source": "In-Browser Cam (YOLO11)",
                     "last_frame": timestamp_str,
                     "fps": 30.0,
                     "yolo_fps": self.yolo_fps or 15.0,

@@ -12,6 +12,18 @@ dist
 dist-ssr
 *.local
 .vercel
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+venv/
+.venv/
+
+# Scratch & temporary files
+Untitled*.txt
 ACTIVE_TUNNEL_URL.txt
 .env
 .env.*
