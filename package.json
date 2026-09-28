@@ -1,0 +1,13 @@
+{
+  "name": "sih-root",
+  "version": "1.0.0",
+  "description": "MoSJE SIH Smart Inspection Root Project",
+  "scripts": {
+    "build": "npm --prefix admin_dashboard run build",
+    "dev": "npm --prefix admin_dashboard run dev",
+    "preview": "npm --prefix admin_dashboard run preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
